@@ -142,6 +142,7 @@ def main():
     import sounddevice as sd
 
     start_time = time.perf_counter()
+    detect_tick = 0
 
     _LOGGER.info("Ready")
 
@@ -164,12 +165,16 @@ def main():
                         "label": detection.label,
                         "detect_seconds": detection.detect_time - start_time,
                         "detect_timestamp": time.time(),
+                        "detect_tick": detect_tick,
+                        "detect_probability": detection.label_probability,
                         "model": model_name,
                     },
                     sys.stdout,
                     ensure_ascii=False,
                 )
                 print("", flush=True)
+
+                detect_tick += 1
         except KeyboardInterrupt:
             pass
         finally:
@@ -180,7 +185,7 @@ def main():
 # -----------------------------------------------------------------------------
 
 
-def sd_callback(rec, frames, time, status):
+def sd_callback(rec, frames, _time, status):
     """sounddevice callback function"""
 
     # Notify if errors

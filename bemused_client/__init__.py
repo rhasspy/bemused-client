@@ -31,6 +31,11 @@ class KeywordConfig:
     # Seconds before a second detection can occur
     refractory_seconds: float = 1.0
 
+    # Number of frames to keep a moving average of output probabilities
+    moving_average_frames: int = 20
+
+    moving_average_threshold: float = 0.24
+
     # If True, log details of every detector loop
     log_detector: bool = False
 
@@ -44,6 +49,9 @@ class KeywordDetection:
 
     # Time of detection according to time.perf_counter()
     detect_time: float
+
+    # Moving average of label probability at detection
+    label_probability: float
 
     # Optional user tag passed in from process_chunk.
     # Lets you determine which audio chunk produced the detection.
@@ -150,11 +158,13 @@ class KeywordDetector:
             for state_idx in range(len(input_details))
         ]
 
+        num_labels = output_details[0]["shape"][1]
+        past_outputs = np.zeros(
+            (num_labels, self.config.moving_average_frames), dtype=np.float32
+        )
+        convolve_ones = np.ones(num_labels) / num_labels
+
         # Previous label index
-        last_argmax = -1
-
-        out_max = 0
-
         # Reference time for refractory period
         refractory_start_time = 0
 
@@ -182,17 +192,6 @@ class KeywordDetector:
             self.interpreter.invoke()
             output_data = self.interpreter.get_tensor(output_details[0]["index"])
 
-            if self.config.log_detector:
-                # Log fine-grained details
-                loop_time = time.perf_counter() - loop_start_time
-                _LOGGER.debug(
-                    "Loop: time=%s, last_argmax=%s, out_max=%s, output=%s",
-                    loop_time,
-                    last_argmax,
-                    out_max,
-                    output_data,
-                )
-
             # Get output states and set it back to input states, which will be
             # fed into the next inference cycle.
             for state_idx in range(1, len(input_details)):
@@ -202,32 +201,66 @@ class KeywordDetector:
                     output_details[state_idx]["index"]
                 )
 
+            # Keep a history of past output probabilities.
+            # The number of frames is controlled by config.moving_average_frames
+            past_outputs[:, :-1] = past_outputs[:, 1:]
+            past_outputs[:, -1] = softmax(output_data[0])
+
+            # Compute the moving average of each keyword's probability history.
+            detect_label = -1
+            detect_probability = 0.0
+
+            label_averages = []
+            for label_idx in range(num_labels):
+                # Moving average computed using convolve.
+                # See: https://stackoverflow.com/questions/14313510/how-to-calculate-rolling-moving-average-using-numpy-scipy
+                label_avg = np.convolve(past_outputs[label_idx], convolve_ones)[0]
+                if self.config.log_detector:
+                    label_averages.append(label_avg)
+
+                # Check if label's moving average probability goes above threshold
+                if label_avg > self.config.moving_average_threshold:
+                    detect_label = label_idx
+                    detect_probability = label_avg
+                    if not self.config.log_detector:
+                        break
+
+            if self.config.log_detector:
+                # Log fine-grained details
+                loop_time = time.perf_counter() - loop_start_time
+                _LOGGER.debug(
+                    "Loop: time=%s, averages=%s, output=%s",
+                    loop_time,
+                    label_averages,
+                    output_data[0],
+                )
+
             # Determine the winner
-            out_tflite_argmax = np.argmax(output_data)
-            if last_argmax == out_tflite_argmax:
-                if output_data[0][out_tflite_argmax] > out_max:
-                    out_max = output_data[0][out_tflite_argmax]
-            else:
-                out_max = 0
-                detect_label = int(out_tflite_argmax)
+            if detect_label in self.config.keyword_labels:
+                # Detection occurred
+                detect_time = time.perf_counter()
 
-                if detect_label in self.config.keyword_labels:
-                    # Detection occurred
-                    detect_time = time.perf_counter()
-
-                    # Check refractory period
-                    if (
-                        detect_time - refractory_start_time
-                    ) > self.config.refractory_seconds:
-                        # Post to detection queue
-                        self.detect_queue.put_nowait(
-                            KeywordDetection(
-                                label=detect_label,
-                                detect_time=detect_time,
-                                tag=tag,
-                            )
+                # Check refractory period
+                if (
+                    detect_time - refractory_start_time
+                ) > self.config.refractory_seconds:
+                    # Post to detection queue
+                    self.detect_queue.put_nowait(
+                        KeywordDetection(
+                            label=detect_label,
+                            detect_time=detect_time,
+                            label_probability=detect_probability,
+                            tag=tag,
                         )
+                    )
 
-                        refractory_start_time = time.perf_counter()
+                    refractory_start_time = time.perf_counter()
 
-            last_argmax = out_tflite_argmax
+
+# -----------------------------------------------------------------------------
+
+
+def softmax(x):
+    """Compute softmax values for each sets of scores in x."""
+    e_x = np.exp(x - np.max(x))
+    return e_x / e_x.sum()
