@@ -12,6 +12,8 @@ _LOGGER = logging.getLogger("bemused_client")
 
 # -----------------------------------------------------------------------------
 
+DEFAULT_NUM_HITS_TO_DETECT = 9
+
 
 @dataclass
 class KeywordConfig:
@@ -25,16 +27,24 @@ class KeywordConfig:
 
     # Audio settings for model
     sample_rate: int = 16000
+    sample_bytes: int = 2
     num_channels: int = 1
-    block_ms: int = 20  # block_size = sample_rate * (block_ms / 1000)
+
+    # Size of audio chunks to read at a time
+    block_ms: int = 20  # block_samples = sample_rate * (block_ms / 1000)
+
+    # Size of audio chunk to process at a time
+    process_ms: int = 20  # process_samples = sample_rate * (process_ms / 1000)
+
+    # If True, model state is kept and passed back in
+    streaming: bool = False
 
     # Seconds before a second detection can occur
     refractory_seconds: float = 1.0
 
-    # Number of frames to keep a moving average of output probabilities
-    moving_average_frames: int = 20
-
-    moving_average_threshold: float = 0.24
+    # Number of times in a row that a label must be the highest probability to
+    # trigger a detection.
+    num_hits_to_detect: int = DEFAULT_NUM_HITS_TO_DETECT
 
     # If True, log details of every detector loop
     log_detector: bool = False
@@ -49,9 +59,6 @@ class KeywordDetection:
 
     # Time of detection according to time.perf_counter()
     detect_time: float
-
-    # Moving average of label probability at detection
-    label_probability: float
 
     # Optional user tag passed in from process_chunk.
     # Lets you determine which audio chunk produced the detection.
@@ -74,7 +81,12 @@ class KeywordDetector:
         self.detect_queue: "Queue[KeywordDetection]" = Queue()
 
         # Expected size of audio chunks
-        self.block_size = int(self.config.sample_rate * (self.config.block_ms / 1000.0))
+        self.block_samples = int(
+            self.config.sample_rate * (self.config.block_ms / 1000.0)
+        )
+        self.process_samples = int(
+            self.config.sample_rate * (self.config.process_ms / 1000.0)
+        )
 
         # Detection thread
         self.detect_thread: typing.Optional[threading.Thread] = None
@@ -85,6 +97,12 @@ class KeywordDetector:
 
         # Queue of (audio, tag) pairs or None (signals stop)
         self.chunk_queue: "Queue[typing.Optional[typing.Tuple[np.ndarray, typing.Any]]]" = Queue()
+
+        self.chunk_buffer: typing.Optional[np.ndarray] = None
+
+        self.last_label: int = -1
+        self.chunk_processed_event = threading.Event()
+        self.detected: bool = False
 
     def start(self):
         """Load model and start detection thread"""
@@ -128,6 +146,7 @@ class KeywordDetector:
         self,
         chunk: typing.Union[bytes, np.ndarray],
         tag: typing.Optional[typing.Any] = None,
+        wait: bool = False,
     ):
         """
         Send a single audio chunk to the detection thread (non-blocking).
@@ -139,14 +158,34 @@ class KeywordDetector:
         if not self.running:
             return
 
+        self.detected = False
+
         # Convert to numpy array if necessary
         if isinstance(chunk, bytes):
-            chunk_array = np.frombuffer(chunk, dtype=np.float32)
+            chunk_array = np.frombuffer(chunk, dtype=np.int16)
         else:
-            chunk_array = chunk.astype(np.float32)
+            chunk_array = chunk
 
-        chunk_array = np.reshape(chunk_array, (1, self.block_size))
-        self.chunk_queue.put_nowait((chunk_array, tag))
+        chunk_array = chunk_array.astype(np.float32)
+        chunk_array = np.reshape(chunk_array, (1, len(chunk_array)))
+
+        if self.chunk_buffer is None:
+            self.chunk_buffer = chunk_array
+        else:
+            self.chunk_buffer = np.concatenate((self.chunk_buffer, chunk_array), axis=1)
+
+        if self.chunk_buffer.shape[1] >= self.process_samples:
+            self.chunk_processed_event.clear()
+
+            self.chunk_queue.put_nowait(
+                (self.chunk_buffer[:, : self.process_samples], tag)
+            )
+            self.chunk_buffer = self.chunk_buffer[:, self.block_samples :]
+
+            if wait:
+                self.chunk_processed_event.wait()
+
+        return self.last_label
 
     def _detect_proc(self):
         # Get input and output tensors.
@@ -159,14 +198,16 @@ class KeywordDetector:
         ]
 
         num_labels = output_details[0]["shape"][1]
-        past_outputs = np.zeros(
-            (num_labels, self.config.moving_average_frames), dtype=np.float32
-        )
-        convolve_ones = np.ones(num_labels) / num_labels
+        label_counts = np.zeros(num_labels)
 
-        # Previous label index
-        # Reference time for refractory period
-        refractory_start_time = 0
+        # Indexes of non-keyword labels
+        kw_labels = list(self.config.keyword_labels)
+
+        # Samples for refractory period
+        refractory_samples_left = 0
+        refractory_num_samples = (
+            self.config.refractory_seconds * self.config.sample_rate
+        )
 
         # Detection loop
         while self.running:
@@ -183,78 +224,90 @@ class KeywordDetector:
             self.interpreter.set_tensor(input_details[0]["index"], chunk)
 
             # Set input states (index 1...)
-            for state_idx in range(1, len(input_details)):
-                self.interpreter.set_tensor(
-                    input_details[state_idx]["index"], inputs[state_idx]
-                )
+            if self.config.streaming:
+                for state_idx in range(1, len(input_details)):
+                    self.interpreter.set_tensor(
+                        input_details[state_idx]["index"], inputs[state_idx]
+                    )
 
             # Run detection
             self.interpreter.invoke()
             output_data = self.interpreter.get_tensor(output_details[0]["index"])
 
-            # Get output states and set it back to input states, which will be
-            # fed into the next inference cycle.
-            for state_idx in range(1, len(input_details)):
-                # The function `get_tensor()` returns a copy of the tensor data.
-                # Use `tensor()` in order to get a pointer to the tensor.
-                inputs[state_idx] = self.interpreter.get_tensor(
-                    output_details[state_idx]["index"]
-                )
+            if self.config.streaming:
+                # Get output states and set it back to input states, which will be
+                # fed into the next inference cycle.
+                for state_idx in range(1, len(input_details)):
+                    # The function `get_tensor()` returns a copy of the tensor data.
+                    # Use `tensor()` in order to get a pointer to the tensor.
+                    inputs[state_idx] = self.interpreter.get_tensor(
+                        output_details[state_idx]["index"]
+                    )
 
-            # Keep a history of past output probabilities.
-            # The number of frames is controlled by config.moving_average_frames
-            past_outputs[:, :-1] = past_outputs[:, 1:]
-            past_outputs[:, -1] = softmax(output_data[0])
+            # Determine best label
+            max_label = int(np.argmax(output_data[0]))
 
-            # Compute the moving average of each keyword's probability history.
-            detect_label = -1
-            detect_probability = 0.0
-
-            label_averages = []
-            for label_idx in range(num_labels):
-                # Moving average computed using convolve.
-                # See: https://stackoverflow.com/questions/14313510/how-to-calculate-rolling-moving-average-using-numpy-scipy
-                label_avg = np.convolve(past_outputs[label_idx], convolve_ones)[0]
-                if self.config.log_detector:
-                    label_averages.append(label_avg)
-
-                # Check if label's moving average probability goes above threshold
-                if label_avg > self.config.moving_average_threshold:
-                    detect_label = label_idx
-                    detect_probability = label_avg
-                    if not self.config.log_detector:
-                        break
+            detected = False
+            if max_label in self.config.keyword_labels:
+                label_counts[max_label] += 1
+                if label_counts[max_label] >= self.config.num_hits_to_detect:
+                    detected = True
+            else:
+                label_counts[kw_labels] -= 1
+                label_counts = np.clip(label_counts, 0, None)
 
             if self.config.log_detector:
                 # Log fine-grained details
                 loop_time = time.perf_counter() - loop_start_time
                 _LOGGER.debug(
-                    "Loop: time=%s, averages=%s, output=%s",
+                    "Loop: time=%s, max=%s, counts=%s, output=%s",
                     loop_time,
-                    label_averages,
+                    max_label,
+                    label_counts,
                     output_data[0],
                 )
 
-            # Determine the winner
-            if detect_label in self.config.keyword_labels:
+            self.last_label = max_label
+
+            if detected:
                 # Detection occurred
                 detect_time = time.perf_counter()
 
                 # Check refractory period
-                if (
-                    detect_time - refractory_start_time
-                ) > self.config.refractory_seconds:
+                if refractory_samples_left <= 0:
                     # Post to detection queue
+                    self.detected = True
                     self.detect_queue.put_nowait(
                         KeywordDetection(
-                            label=detect_label,
-                            detect_time=detect_time,
-                            label_probability=detect_probability,
-                            tag=tag,
+                            label=max_label, detect_time=detect_time, tag=tag
                         )
                     )
 
-                    refractory_start_time = time.perf_counter()
+                    refractory_samples_left = refractory_num_samples
+                    _LOGGER.debug(
+                        "Keyword detected at %s, counts=%s", detect_time, label_counts
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Detection occurred during refractory period (%s/%s sample(s) left)",
+                        refractory_samples_left,
+                        refractory_num_samples,
+                    )
+
+                # Reset all label counts
+                label_counts[:] = 0
+
+                # Reset streaming state
+                if self.config.streaming:
+                    inputs = [
+                        np.zeros(input_details[state_idx]["shape"], dtype=np.float32)
+                        for state_idx in range(len(input_details))
+                    ]
+
+            if refractory_samples_left > 0:
+                refractory_samples_left -= chunk.shape[1]
+
+            self.chunk_processed_event.set()
 
 
 # -----------------------------------------------------------------------------

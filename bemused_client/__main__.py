@@ -1,12 +1,14 @@
 import argparse
 import json
 import logging
+import os
 import sys
+import threading
 import time
 import typing
 from pathlib import Path
 
-from . import KeywordConfig, KeywordDetector
+from . import KeywordConfig, KeywordDetector, DEFAULT_NUM_HITS_TO_DETECT
 
 # -----------------------------------------------------------------------------
 
@@ -30,10 +32,23 @@ def main():
     )
 
     parser.add_argument(
+        "--num-hits-to-detect",
+        type=int,
+        default=DEFAULT_NUM_HITS_TO_DETECT,
+        help="Number of times a keyword label must be the best before a detection occurs",
+    )
+
+    parser.add_argument(
         "--refractory-seconds",
         type=float,
         default=1.0,
         help="Seconds before a another detection can occur",
+    )
+
+    parser.add_argument(
+        "--stdin-audio",
+        action="store_true",
+        help="Read 16Khz, 16-bit PCM audio from stdin instead of microphone",
     )
 
     # HTTP settings
@@ -123,6 +138,9 @@ def main():
             sample_rate=int(json_config.get("sample_rate", 16000)),
             num_channels=int(json_config.get("num_channels", 1)),
             block_ms=int(json_config.get("block_ms", 20)),
+            process_ms=int(json_config.get("process_ms", 100)),
+            streaming=bool(json_config.get("streaming", False)),
+            num_hits_to_detect=args.num_hits_to_detect,
             refractory_seconds=args.refractory_seconds,
             log_detector=args.log_detector,
         )
@@ -137,44 +155,51 @@ def main():
     _DETECTOR = KeywordDetector(config=kw_config)
     _DETECTOR.start()
 
+    # Start detector printing thread
+    threading.Thread(
+        target=detector_proc, args=(model_name, keyword_names), daemon=True
+    ).start()
+
+    if args.stdin_audio:
+        if os.isatty(sys.stdin.fileno()):
+            print("Reading 16khz 16-bit mono PCM from stdin...", file=sys.stdin)
+
+        try:
+            chunk_size = _DETECTOR.block_samples * kw_config.sample_bytes
+            chunk_number = 0
+
+            while True:
+                chunk = sys.stdin.buffer.read(chunk_size)
+                if not chunk:
+                    break
+
+                audio_sec = chunk_number * (kw_config.block_ms / 1000)
+                _DETECTOR.process_chunk(chunk, tag=audio_sec)
+                chunk_number += 1
+        except KeyboardInterrupt:
+            # Exit immediately
+            sys.exit(0)
+
+        # Process remainder of queue
+        while not _DETECTOR.chunk_queue.empty():
+            time.sleep(0.01)
+
+        sys.exit(0)
+
     # Delay import
     _LOGGER.debug("Starting microphone...")
     import sounddevice as sd
-
-    start_time = time.perf_counter()
-    detect_tick = 0
 
     _LOGGER.info("Ready")
 
     with sd.InputStream(
         channels=kw_config.num_channels,
         samplerate=kw_config.sample_rate,
-        blocksize=_DETECTOR.block_size,
+        blocksize=_DETECTOR.block_samples,
         callback=sd_callback,
     ):
         try:
-            while _DETECTOR.running:
-                detection = _DETECTOR.detect_queue.get()
-
-                # Similar command-line output to Raven
-                json.dump(
-                    {
-                        "keyword": keyword_names.get(
-                            detection.label, str(detection.label)
-                        ),
-                        "label": detection.label,
-                        "detect_seconds": detection.detect_time - start_time,
-                        "detect_timestamp": time.time(),
-                        "detect_tick": detect_tick,
-                        "detect_probability": detection.label_probability,
-                        "model": model_name,
-                    },
-                    sys.stdout,
-                    ensure_ascii=False,
-                )
-                print("", flush=True)
-
-                detect_tick += 1
+            threading.Event().wait()
         except KeyboardInterrupt:
             pass
         finally:
@@ -183,6 +208,35 @@ def main():
 
 
 # -----------------------------------------------------------------------------
+
+
+def detector_proc(model_name: str, keyword_names: typing.Dict[str, str]):
+    """Prints detections to stdout"""
+    assert _DETECTOR
+
+    start_time = time.perf_counter()
+    detect_tick = 0
+
+    while _DETECTOR.running:
+        detection = _DETECTOR.detect_queue.get()
+
+        # Similar command-line output to Raven
+        json.dump(
+            {
+                "keyword": keyword_names.get(detection.label, str(detection.label)),
+                "label": detection.label,
+                "detect_seconds": detection.detect_time - start_time,
+                "detect_timestamp": time.time(),
+                "detect_tick": detect_tick,
+                "model": model_name,
+                "tag": detection.tag,
+            },
+            sys.stdout,
+            ensure_ascii=False,
+        )
+        print("", flush=True)
+
+        detect_tick += 1
 
 
 def sd_callback(rec, frames, _time, status):
