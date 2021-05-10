@@ -8,7 +8,12 @@ import time
 import typing
 from pathlib import Path
 
-from . import KeywordConfig, KeywordDetector, DEFAULT_NUM_HITS_TO_DETECT
+from . import (
+    DEFAULT_NUM_HITS_TO_DETECT,
+    InputFeatureType,
+    KeywordConfig,
+    KeywordDetector,
+)
 
 # -----------------------------------------------------------------------------
 
@@ -140,6 +145,7 @@ def main():
             block_ms=int(json_config.get("block_ms", 20)),
             process_ms=int(json_config.get("process_ms", 100)),
             streaming=bool(json_config.get("streaming", False)),
+            feature_type=str(json_config.get("feature_type", InputFeatureType.RAW)),
             num_hits_to_detect=args.num_hits_to_detect,
             refractory_seconds=args.refractory_seconds,
             log_detector=args.log_detector,
@@ -210,7 +216,7 @@ def main():
 # -----------------------------------------------------------------------------
 
 
-def detector_proc(model_name: str, keyword_names: typing.Dict[str, str]):
+def detector_proc(model_name: str, keyword_names: typing.Dict[int, str]):
     """Prints detections to stdout"""
     assert _DETECTOR
 

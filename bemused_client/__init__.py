@@ -3,16 +3,27 @@ import threading
 import time
 import typing
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from queue import Queue
 
 import numpy as np
+import tensorflow as tf
+
+from .utils import to_micro_spectrogram
 
 _LOGGER = logging.getLogger("bemused_client")
 
 # -----------------------------------------------------------------------------
 
 DEFAULT_NUM_HITS_TO_DETECT = 9
+
+
+class InputFeatureType(str, Enum):
+    """Input audio features for model"""
+
+    RAW = "raw"
+    MICRO_FRONTEND = "micro_frontend"
 
 
 @dataclass
@@ -38,6 +49,9 @@ class KeywordConfig:
 
     # If True, model state is kept and passed back in
     streaming: bool = False
+
+    # Input audio feature type
+    feature_type: InputFeatureType = InputFeatureType.RAW
 
     # Seconds before a second detection can occur
     refractory_seconds: float = 1.0
@@ -71,9 +85,6 @@ class KeywordDetection:
 
 class KeywordDetector:
     def __init__(self, config: KeywordConfig):
-        # Delay import
-        import tensorflow as tf
-
         self.config = config
 
         # Queue to check for detections asynchronously.
@@ -106,9 +117,6 @@ class KeywordDetector:
 
     def start(self):
         """Load model and start detection thread"""
-        # Delay import
-        import tensorflow as tf
-
         if self.running:
             self.stop()
 
@@ -221,7 +229,14 @@ class KeywordDetector:
             loop_start_time = time.perf_counter()
 
             # Prepare model inputs
-            self.interpreter.set_tensor(input_details[0]["index"], chunk)
+            input_data = chunk
+            if self.config.feature_type == InputFeatureType.MICRO_FRONTEND:
+                # MFCC
+                input_data = tf.expand_dims(
+                    tf.expand_dims(to_micro_spectrogram(chunk), 0), -1
+                )
+
+            self.interpreter.set_tensor(input_details[0]["index"], input_data)
 
             # Set input states (index 1...)
             if self.config.streaming:
@@ -305,7 +320,7 @@ class KeywordDetector:
                     ]
 
             if refractory_samples_left > 0:
-                refractory_samples_left -= chunk.shape[1]
+                refractory_samples_left -= self.block_samples
 
             self.chunk_processed_event.set()
 
