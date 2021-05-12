@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import json
 import logging
@@ -7,6 +8,8 @@ import threading
 import time
 import typing
 from pathlib import Path
+
+import numpy as np
 
 from . import (
     DEFAULT_NUM_HITS_TO_DETECT,
@@ -56,6 +59,10 @@ def main():
         help="Read 16Khz, 16-bit PCM audio from stdin instead of microphone",
     )
 
+    parser.add_argument(
+        "--device", help="Set recording device (see python3 -m sounddevice)"
+    )
+
     # HTTP settings
     parser.add_argument(
         "--http-host",
@@ -101,6 +108,12 @@ def main():
 
     # Convert to paths
     args.model_dir = Path(args.model_dir)
+
+    if args.device is not None:
+        try:
+            args.device = int(args.device)
+        except ValueError:
+            pass
 
     # ------------------
     # Load configuration
@@ -203,6 +216,8 @@ def main():
         samplerate=kw_config.sample_rate,
         blocksize=_DETECTOR.block_samples,
         callback=sd_callback,
+        device=args.device,
+        dtype=np.int16,
     ):
         try:
             threading.Event().wait()
