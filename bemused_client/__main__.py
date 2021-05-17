@@ -210,6 +210,9 @@ def main():
     import sounddevice as sd
 
     _LOGGER.info("Ready")
+    dtype = np.int16
+    if json_config.get("dtype", "int16") == "float32":
+        dtype = np.float32
 
     with sd.InputStream(
         channels=kw_config.num_channels,
@@ -217,7 +220,7 @@ def main():
         blocksize=_DETECTOR.block_samples,
         callback=sd_callback,
         device=args.device,
-        dtype=np.int16,
+        dtype=dtype,
     ):
         try:
             threading.Event().wait()
